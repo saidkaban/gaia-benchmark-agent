@@ -11,10 +11,10 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_community.document_loaders import WikipediaLoader
 from langchain_community.document_loaders import ArxivLoader
 from langchain_community.vectorstores import SupabaseVectorStore
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.tools import tool
+from langchain_core.vectorstores import InMemoryVectorStore
 from langchain.tools.retriever import create_retriever_tool
-from supabase.client import Client, create_client
 
 load_dotenv()
 
@@ -112,7 +112,6 @@ def arvix_search(query: str) -> str:
     return {"arvix_results": formatted_search_docs}
 
 
-
 # load the system prompt from the file
 with open("system_prompt.txt", "r", encoding="utf-8") as f:
     system_prompt = f.read()
@@ -122,18 +121,28 @@ sys_msg = SystemMessage(content=system_prompt)
 
 # build a retriever
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2") #  dim=768
-supabase: Client = create_client(
-    os.environ.get("SUPABASE_URL"), 
-    os.environ.get("SUPABASE_SERVICE_KEY"))
-vector_store = SupabaseVectorStore(
-    client=supabase,
-    embedding= embeddings,
-    table_name="documents",
-    query_name="match_documents_langchain",
-)
+# supabase: Client = create_client(
+#     os.environ.get("SUPABASE_URL"), 
+#     os.environ.get("SUPABASE_SERVICE_KEY"))
+vector_store = InMemoryVectorStore(embeddings)
+
+# Add sample documents to the vector store
+from langchain_core.documents import Document
+import pandas as pd
+import ast
+with open("supabase_docs.csv", "r", encoding="utf-8") as f:
+    df = pd.read_csv(f)
+    documents = []
+    for _, row in df.iterrows():
+        content = row["content"]
+        # parse the metadata string into a dict
+        metadata = ast.literal_eval(row["metadata"])
+        documents.append(Document(page_content=content, metadata=metadata))
+vector_store.add_documents(documents)
+
 create_retriever_tool = create_retriever_tool(
     retriever=vector_store.as_retriever(),
-    name="Question Search",
+    name="question_search",
     description="A tool to retrieve similar questions from a vector store.",
 )
 
@@ -148,6 +157,7 @@ tools = [
     wiki_search,
     web_search,
     arvix_search,
+    create_retriever_tool,
 ]
 
 # Build graph function
@@ -160,31 +170,38 @@ def build_graph(provider: str = "google"):
     elif provider == "groq":
         # Groq https://console.groq.com/docs/models
         llm = ChatGroq(model="qwen-qwq-32b", temperature=0) # optional : qwen-qwq-32b gemma2-9b-it
-    elif provider == "huggingface":
-        # TODO: Add huggingface endpoint
-        llm = ChatHuggingFace(
-            llm=HuggingFaceEndpoint(
-                url="https://api-inference.huggingface.co/models/Meta-DeepLearning/llama-2-7b-chat-hf",
-                temperature=0,
-            ),
-        )
     else:
-        raise ValueError("Invalid provider. Choose 'google', 'groq' or 'huggingface'.")
+        raise ValueError("Invalid provider. Choose 'google' or 'groq'.")
     # Bind tools to LLM
     llm_with_tools = llm.bind_tools(tools)
 
     # Node
     def assistant(state: MessagesState):
-        """Assistant node"""
+        last = state["messages"][-1]
+        # If retriever has already answered, do nothing.
+        if isinstance(last, AIMessage) and last.content.startswith("FINAL ANSWER"):
+            return {"messages": state["messages"]}   # short‑circuit
+        # Otherwise call the LLM as usual
         return {"messages": [llm_with_tools.invoke(state["messages"])]}
+
     
     def retriever(state: MessagesState):
-        """Retriever node"""
-        similar_question = vector_store.similarity_search(state["messages"][0].content)
-        example_msg = HumanMessage(
-            content=f"Here I provide a similar question and answer for reference: \n\n{similar_question[0].page_content}",
-        )
-        return {"messages": [sys_msg] + state["messages"] + [example_msg]}
+        query = state["messages"][-1].content
+        hits = vector_store.similarity_search(query, k=1)
+        if not hits:
+            return {"messages": state["messages"]}
+
+        example = hits[0].page_content.strip()          # your stored Q&A blob
+        # Split into question / final answer
+        q_part, a_part = example.split("Final answer :")
+        demo_q   = HumanMessage(content=q_part.strip())
+        demo_ans = AIMessage(content=f"FINAL ANSWER: {a_part.strip()}")
+
+        # Only prepend sys_msg once
+        base = [] if isinstance(state["messages"][0], SystemMessage) else [sys_msg]
+        # **Order matters** – give few‑shot demo *before* the real question
+        new_messages = base + [demo_q, demo_ans] + state["messages"]
+        return {"messages": new_messages}
 
     builder = StateGraph(MessagesState)
     builder.add_node("retriever", retriever)
